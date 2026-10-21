@@ -198,6 +198,14 @@ class NumaAwareKVCacheManager {
       std::optional<size_t> layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt);
 
+#ifndef WITHOUT_PYTHON
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hFromPacked(
+      const nanobind::object& packed_array,
+      const std::vector<int64_t>& dst_offsets_major_dim,
+      const std::vector<int64_t>& copy_sizes_major_dim,
+      bool unsafe_skip_buffer_lock = false);
+#endif
+
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
   D2hAutoAllocate(const std::vector<int64_t>& src_offsets_major_dim = {},
                   const std::vector<int64_t>& copy_sizes_major_dim = {});
@@ -492,6 +500,18 @@ class KVCacheManager {
                               copy_sizes_major_dim, slot_idx, layer_idx,
                               shard_idx);
   }
+
+#ifndef WITHOUT_PYTHON
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hFromPacked(
+      const nanobind::object& packed_array,
+      const std::vector<int64_t>& dst_offsets_major_dim,
+      const std::vector<int64_t>& copy_sizes_major_dim,
+      bool unsafe_skip_buffer_lock = false) {
+    return numa_manager_->D2hFromPacked(packed_array, dst_offsets_major_dim,
+                                        copy_sizes_major_dim,
+                                        unsafe_skip_buffer_lock);
+  }
+#endif
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
   D2hAutoAllocate(const std::vector<int64_t>& src_offsets_major_dim = {},

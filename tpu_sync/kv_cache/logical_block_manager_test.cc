@@ -344,6 +344,40 @@ TEST(LogicalBlockManagerTest,
   EXPECT_EQ(manager.num_free_blocks(), 4);
 }
 
+TEST(LogicalBlockManagerTest, AllocatePrefersBestFitContiguousFreeExtent) {
+  LogicalBlockManager manager(8);
+  // Lock blocks 1 and 5 so free extents are [0] (len 1), [2,3,4] (len 3),
+  // and [6,7] (len 2).
+  ABSL_ASSERT_OK(manager.AllocateTarget({1, 5}));
+
+  // Requesting 2 blocks picks best-fit [6, 7] (preserving [2, 3, 4] intact).
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> two_blocks,
+                       manager.Allocate(2, /*lock=*/true));
+  EXPECT_THAT(two_blocks, ElementsAre(6, 7));
+
+  // Requesting 3 blocks now gets the contiguous [2, 3, 4] run instead of
+  // fragmenting across [0, 2, 3].
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> three_blocks,
+                       manager.Allocate(3, /*lock=*/true));
+  EXPECT_THAT(three_blocks, ElementsAre(2, 3, 4));
+}
+
+TEST(LogicalBlockManagerTest,
+     AllocatePrefersContiguousLruCohortAndReturnsSortedIds) {
+  LogicalBlockManager manager(6);
+  // Allocate all 6 blocks in one cohort, then lock block 1 so unlocked
+  // equal-timestamp blocks are [0] and [2, 3, 4], while block 5 is freed.
+  ABSL_ASSERT_OK(manager.AllocateTarget({0, 1, 2, 3, 4, 5}));
+  ABSL_ASSERT_OK(manager.Unlock({0, 2, 3, 4}));
+  ABSL_ASSERT_OK(manager.Deallocate({5}));
+
+  // Requesting 4 blocks uses free block [5] plus 3 evicted blocks from the
+  // contiguous [2, 3, 4] run, returning ascending-sorted [2, 3, 4, 5].
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> allocated,
+                       manager.Allocate(4, /*lock=*/true));
+  EXPECT_THAT(allocated, ElementsAre(2, 3, 4, 5));
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

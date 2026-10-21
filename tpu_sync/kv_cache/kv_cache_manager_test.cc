@@ -4111,6 +4111,219 @@ TEST(KVCacheManagerTest, D2hWriteAndH2dWriteOverPeregrineOp6Succeed) {
                               /*dst_device=*/{0}, /*copy_sizes=*/{1}),
               StatusIs(absl::StatusCode::kFailedPrecondition));
 }
+
+struct FragmentationPjRtRig {
+  static constexpr size_t kNumLayers = 3;
+  static constexpr size_t kNumDeviceBlocks = 8;
+  static constexpr size_t kNumHostBlocks = 8;
+  static constexpr size_t kBlockBytes = 256;
+
+  std::unique_ptr<xla::PjRtClient> client;
+  std::vector<std::unique_ptr<xla::PjRtBuffer>> pjrt_buffers;
+  std::vector<std::vector<raiden::RaidenBufferHandle>> layer_handles;
+  std::unique_ptr<KVCacheManagerBase> manager;
+  int bounce_alloc_calls = 0;
+
+  static uint8_t ExpectedByte(size_t layer, size_t block, size_t offset) {
+    return static_cast<uint8_t>((layer * 37 + block * 13 + offset) & 0xFF);
+  }
+
+  void Init() {
+    TF_ASSERT_OK_AND_ASSIGN(client,
+                         xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
+    TF_ASSERT_OK_AND_ASSIGN(
+        xla::PjRtMemorySpace * memory_space,
+        client->addressable_devices()[0]->default_memory_space());
+
+    layer_handles.resize(kNumLayers);
+    for (size_t layer = 0; layer < kNumLayers; ++layer) {
+      std::vector<uint8_t> init_data(kNumDeviceBlocks * kBlockBytes, 0);
+      for (size_t blk = 0; blk < kNumDeviceBlocks; ++blk) {
+        for (size_t off = 0; off < kBlockBytes; ++off) {
+          init_data[blk * kBlockBytes + off] = ExpectedByte(layer, blk, off);
+        }
+      }
+      TF_ASSERT_OK_AND_ASSIGN(
+          std::unique_ptr<xla::PjRtBuffer> buf,
+          client->BufferFromHostBuffer(
+              init_data.data(), xla::U8,
+              {static_cast<int64_t>(kNumDeviceBlocks),
+               static_cast<int64_t>(kBlockBytes)},
+              /*byte_strides=*/std::nullopt,
+              xla::PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
+              /*on_done_with_host_buffer=*/nullptr, memory_space,
+              /*device_layout=*/nullptr));
+      TF_ASSERT_OK_AND_ASSIGN(raiden::RaidenBufferHandle handle,
+                           raiden::RaidenBufferHandle::Acquire(buf.get()));
+      pjrt_buffers.push_back(std::move(buf));
+      layer_handles[layer].push_back(std::move(handle));
+    }
+
+    auto default_alloc = MakeDefaultHostBufferAllocator();
+    HostBufferAllocator counting_alloc =
+        [this, default_alloc](size_t size_bytes, const xla::PjRtDevice* device)
+        -> absl::StatusOr<HostBufferAllocation> {
+      ++bounce_alloc_calls;
+      return default_alloc(size_bytes, device);
+    };
+
+    manager = std::make_unique<KVCacheManagerBase>(
+        layer_handles, /*local_port=*/std::nullopt,
+        /*host_blocks_to_allocate=*/static_cast<int>(kNumHostBlocks),
+        /*unsafe_skip_buffer_lock=*/true, /*parallelism=*/1,
+        /*host_allocator=*/counting_alloc);
+    // Reset counter after initial host mirror allocation so subsequent counts
+    // reflect bounce-pool allocations only.
+    bounce_alloc_calls = 0;
+  }
+};
+
+TEST(KVCacheManagerTest,
+     HostBounceCoalescesScatteredHostSlotsAndReusesPooledBuffer) {
+  ScopedEnvVar enable_bounce("RAIDEN_ENABLE_HOST_BOUNCE_COALESCE", "1");
+  FragmentationPjRtRig rig;
+  ASSERT_NO_FATAL_FAILURE(rig.Init());
+
+  // Out-of-order contiguous HBM blocks {2, 0, 3, 1} saved into scattered LRU
+  // host slots {5, 7, 1, 3}.
+  const std::vector<int64_t> src_dev = {2, 0, 3, 1};
+  const std::vector<int64_t> dst_host = {5, 7, 1, 3};
+  const std::vector<int64_t> sizes = {1, 1, 1, 1};
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture d2h_first,
+                       rig.manager->D2h(src_dev, dst_host, sizes));
+  ABSL_ASSERT_OK(d2h_first.Await());
+  const int allocs_after_first = rig.bounce_alloc_calls;
+  EXPECT_GE(allocs_after_first, 1);
+
+  for (size_t layer = 0; layer < FragmentationPjRtRig::kNumLayers; ++layer) {
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_span,
+                         rig.manager->GetHostBuffer(layer, 0));
+    const uint8_t* host_ptr = host_span.data();
+    ASSERT_NE(host_ptr, nullptr);
+    for (size_t idx = 0; idx < src_dev.size(); ++idx) {
+      const size_t blk = static_cast<size_t>(src_dev[idx]);
+      const size_t host_slot = static_cast<size_t>(dst_host[idx]);
+      for (size_t off = 0; off < FragmentationPjRtRig::kBlockBytes; ++off) {
+        EXPECT_EQ(host_ptr[host_slot * FragmentationPjRtRig::kBlockBytes + off],
+                  FragmentationPjRtRig::ExpectedByte(layer, blk, off));
+      }
+    }
+  }
+
+  // Fragmented H2D load from scattered host slots {7, 3, 5, 1} into contiguous
+  // HBM blocks {4, 5, 6, 7}. Scoped so `keep_alive` returns all per-layer
+  // bounce buffers to the pool once `Await()` completes.
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        raiden::PjRtCopyFuture h2d_load,
+        rig.manager->H2d(/*src_offsets_major_dim=*/{7, 3, 5, 1},
+                         /*dst_offsets_major_dim=*/{4, 5, 6, 7},
+                         /*copy_sizes_major_dim=*/{1, 1, 1, 1}));
+    ABSL_ASSERT_OK(h2d_load.Await());
+  }
+  const int allocs_after_warmup = rig.bounce_alloc_calls;
+  EXPECT_LE(allocs_after_warmup,
+            static_cast<int>(FragmentationPjRtRig::kNumLayers));
+
+  // Subsequent fragmented D2H and H2D transfers reuse the pooled bounce
+  // buffers with zero additional allocations.
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        raiden::PjRtCopyFuture d2h_second,
+        rig.manager->D2h({1, 0, 3, 2}, {6, 0, 4, 2}, {1, 1, 1, 1}));
+    ABSL_ASSERT_OK(d2h_second.Await());
+    TF_ASSERT_OK_AND_ASSIGN(
+        raiden::PjRtCopyFuture h2d_second,
+        rig.manager->H2d({0, 6, 2, 4}, {4, 5, 6, 7}, {1, 1, 1, 1}));
+    ABSL_ASSERT_OK(h2d_second.Await());
+  }
+  EXPECT_EQ(rig.bounce_alloc_calls, allocs_after_warmup);
+
+  // Verify HBM blocks {4, 5, 6, 7} now match original HBM blocks {0, 1, 2, 3}.
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture verify_d2h,
+                       rig.manager->D2h({4}, {0}, {4}));
+  ABSL_ASSERT_OK(verify_d2h.Await());
+  for (size_t layer = 0; layer < FragmentationPjRtRig::kNumLayers; ++layer) {
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_span,
+                         rig.manager->GetHostBuffer(layer, 0));
+    const uint8_t* host_ptr = host_span.data();
+    for (size_t b = 0; b < 4; ++b) {
+      for (size_t off = 0; off < FragmentationPjRtRig::kBlockBytes; ++off) {
+        EXPECT_EQ(host_ptr[b * FragmentationPjRtRig::kBlockBytes + off],
+                  FragmentationPjRtRig::ExpectedByte(layer, b, off));
+      }
+    }
+  }
+}
+
+TEST(KVCacheManagerTest,
+     D2hFromPackedDeviceBufferScattersAllLayersFromSingleBulkDma) {
+  FragmentationPjRtRig rig;
+  ASSERT_NO_FATAL_FAILURE(rig.Init());
+
+  // Simulate an on-device HBM gather of non-contiguous blocks {0, 3, 6} across
+  // all layers in layer-major order [layer][0..3).
+  const std::vector<size_t> gathered_blocks = {0, 3, 6};
+  const size_t num_gathered = gathered_blocks.size();
+  std::vector<uint8_t> packed_host(
+      FragmentationPjRtRig::kNumLayers * num_gathered *
+          FragmentationPjRtRig::kBlockBytes,
+      0);
+  for (size_t l = 0; l < FragmentationPjRtRig::kNumLayers; ++l) {
+    for (size_t g = 0; g < num_gathered; ++g) {
+      const size_t dst_idx =
+          (l * num_gathered + g) * FragmentationPjRtRig::kBlockBytes;
+      for (size_t off = 0; off < FragmentationPjRtRig::kBlockBytes; ++off) {
+        packed_host[dst_idx + off] =
+            FragmentationPjRtRig::ExpectedByte(l, gathered_blocks[g], off);
+      }
+    }
+  }
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      rig.client->addressable_devices()[0]->default_memory_space());
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<xla::PjRtBuffer> packed_buf,
+      rig.client->BufferFromHostBuffer(
+          packed_host.data(), xla::U8,
+          {static_cast<int64_t>(FragmentationPjRtRig::kNumLayers),
+           static_cast<int64_t>(num_gathered),
+           static_cast<int64_t>(FragmentationPjRtRig::kBlockBytes)},
+          /*byte_strides=*/std::nullopt,
+          xla::PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
+          /*on_done_with_host_buffer=*/nullptr, memory_space,
+          /*device_layout=*/nullptr));
+  TF_ASSERT_OK_AND_ASSIGN(raiden::RaidenBufferHandle packed_handle,
+                       raiden::RaidenBufferHandle::Acquire(packed_buf.get()));
+  std::vector<raiden::RaidenBufferHandle> packed_shards;
+  packed_shards.push_back(std::move(packed_handle));
+
+  // Scatter into discontiguous host slots {6, 2, 4} from a single packed DMA.
+  const std::vector<int64_t> dst_host_slots = {6, 2, 4};
+  const std::vector<int64_t> copy_sizes = {1, 1, 1};
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture packed_d2h,
+      rig.manager->D2hFromPackedDeviceBuffer(packed_shards, dst_host_slots,
+                                             copy_sizes));
+  ABSL_ASSERT_OK(packed_d2h.Await());
+
+  for (size_t l = 0; l < FragmentationPjRtRig::kNumLayers; ++l) {
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_span,
+                         rig.manager->GetHostBuffer(l, 0));
+    const uint8_t* host_ptr = host_span.data();
+    ASSERT_NE(host_ptr, nullptr);
+    for (size_t g = 0; g < num_gathered; ++g) {
+      const size_t slot = static_cast<size_t>(dst_host_slots[g]);
+      for (size_t off = 0; off < FragmentationPjRtRig::kBlockBytes; ++off) {
+        EXPECT_EQ(host_ptr[slot * FragmentationPjRtRig::kBlockBytes + off],
+                  FragmentationPjRtRig::ExpectedByte(l, gathered_blocks[g],
+                                                     off));
+      }
+    }
+  }
+}
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

@@ -736,6 +736,17 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<size_t> host_layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt);
 
+  // Bulk D2H from a pre-packed device buffer (one handle per shard) whose
+  // on-device layout packs all `num_layers_` layers contiguously in layer-major
+  // order `[layer][0..total_blocks)`. Issues one bulk DMA per shard (or bounded
+  // bounce chunk) and scatters into each layer's host DRAM buffer at
+  // `dst_offsets_major_dim`.
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hFromPackedDeviceBuffer(
+      absl::Span<const raiden::RaidenBufferHandle> packed_shards,
+      const std::vector<int64_t>& dst_offsets_major_dim,
+      const std::vector<int64_t>& copy_sizes_major_dim,
+      std::optional<int64_t> slot_idx = std::nullopt);
+
   // Per-layer device buffer holds bundled with the layer's on-device size.
   // For uniform models every layer has the same physical_size; for hybrid
   // (HMA) models sizes may differ (e.g. mamba conv_state bf16 vs ssm f32).
@@ -968,7 +979,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   std::shared_ptr<const PoolStagingLease> PoolStagingLeaseSnapshot(
       size_t storage_idx, uint64_t uuid) const;
 
+  struct HostBouncePool;
   HostBufferAllocator host_allocator_ = nullptr;
+  std::shared_ptr<HostBouncePool> bounce_pool_;
+  std::shared_ptr<HostBouncePool> EnsureBouncePool();
 
   absl::StatusOr<std::shared_ptr<const TransferPlan>> GetTransferPlan(
       uint64_t uuid) const;

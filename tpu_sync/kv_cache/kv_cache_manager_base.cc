@@ -182,7 +182,9 @@ absl::StatusOr<std::vector<int>> ToHostBlockIds(
 }
 
 // Coalesce runs of adjacent copies into one, so a run of N consecutive
-// 1-block copies becomes one N-block copy.
+// 1-block copies becomes one N-block copy. When destination intervals do not
+// overlap, segments are first sorted by `(src, dst)` so out-of-order block IDs
+// (e.g. from hash/LRU tables) still fuse into bulk DMAs.
 void CoalesceMajorDimCopies(const std::vector<int64_t>& src_offsets,
                             const std::vector<int64_t>& dst_offsets,
                             const std::vector<int64_t>& sizes,
@@ -192,17 +194,117 @@ void CoalesceMajorDimCopies(const std::vector<int64_t>& src_offsets,
   out_src.clear();
   out_dst.clear();
   out_sizes.clear();
+  if (src_offsets.empty() || src_offsets.size() != dst_offsets.size() ||
+      src_offsets.size() != sizes.size()) {
+    return;
+  }
+
+  struct CopySeg {
+    int64_t src;
+    int64_t dst;
+    int64_t size;
+  };
+  std::vector<CopySeg> segs;
+  segs.reserve(src_offsets.size());
+  bool has_positive_size = false;
   for (size_t i = 0; i < src_offsets.size(); ++i) {
-    if (!out_src.empty() &&
-        src_offsets[i] == out_src.back() + out_sizes.back() &&
-        dst_offsets[i] == out_dst.back() + out_sizes.back()) {
-      out_sizes.back() += sizes[i];
-    } else {
-      out_src.push_back(src_offsets[i]);
-      out_dst.push_back(dst_offsets[i]);
-      out_sizes.push_back(sizes[i]);
+    if (sizes[i] > 0) {
+      has_positive_size = true;
+    }
+    segs.push_back({src_offsets[i], dst_offsets[i], sizes[i]});
+  }
+
+  if (segs.size() > 1 && has_positive_size) {
+    std::vector<CopySeg> positive_by_dst;
+    positive_by_dst.reserve(segs.size());
+    for (const CopySeg& s : segs) {
+      if (s.size > 0) {
+        positive_by_dst.push_back(s);
+      }
+    }
+    std::sort(positive_by_dst.begin(), positive_by_dst.end(),
+              [](const CopySeg& a, const CopySeg& b) {
+                if (a.dst != b.dst) return a.dst < b.dst;
+                return a.size < b.size;
+              });
+    bool dst_disjoint = true;
+    for (size_t i = 1; i < positive_by_dst.size(); ++i) {
+      if (positive_by_dst[i].dst <
+          positive_by_dst[i - 1].dst + positive_by_dst[i - 1].size) {
+        dst_disjoint = false;
+        break;
+      }
+    }
+    if (dst_disjoint) {
+      segs.swap(positive_by_dst);
+      std::sort(segs.begin(), segs.end(),
+                [](const CopySeg& a, const CopySeg& b) {
+                  if (a.src != b.src) return a.src < b.src;
+                  return a.dst < b.dst;
+                });
     }
   }
+
+  for (const CopySeg& s : segs) {
+    if (!out_src.empty() && s.src == out_src.back() + out_sizes.back() &&
+        s.dst == out_dst.back() + out_sizes.back()) {
+      out_sizes.back() += s.size;
+    } else {
+      out_src.push_back(s.src);
+      out_dst.push_back(s.dst);
+      out_sizes.push_back(s.size);
+    }
+  }
+}
+
+bool IsHostBounceCoalesceEnabled() {
+  const char* env = std::getenv("RAIDEN_ENABLE_HOST_BOUNCE_COALESCE");
+  if (env == nullptr || env[0] == '\0') {
+    return true;
+  }
+  const std::string val = absl::AsciiStrToLower(env);
+  return val != "0" && val != "false" && val != "off";
+}
+
+size_t MaxHostBounceBytes() {
+  constexpr size_t kDefaultMaxBounceBytes = 64ULL << 20;  // 64 MiB
+  const char* env = std::getenv("RAIDEN_HOST_BOUNCE_MAX_BYTES");
+  if (env == nullptr || env[0] == '\0') {
+    return kDefaultMaxBounceBytes;
+  }
+  uint64_t parsed = 0;
+  if (absl::SimpleAtoi(env, &parsed) && parsed > 0) {
+    return static_cast<size_t>(parsed);
+  }
+  return kDefaultMaxBounceBytes;
+}
+
+size_t RoundUpBounceAllocBytes(size_t min_bytes) {
+  constexpr size_t kMinBounceAllocBytes = 256ULL << 10;  // 256 KiB
+  size_t cap = std::max(min_bytes, kMinBounceAllocBytes);
+  size_t pow2 = kMinBounceAllocBytes;
+  while (pow2 < cap && pow2 < (1ULL << 30)) {
+    pow2 <<= 1;
+  }
+  return std::max(cap, pow2);
+}
+
+struct ByteCopySeg {
+  int64_t host_off;
+  int64_t dev_off;
+  int64_t nbytes;
+};
+
+bool IntervalsDisjoint(absl::Span<const std::pair<int64_t, int64_t>> ranges) {
+  if (ranges.size() <= 1) return true;
+  std::vector<std::pair<int64_t, int64_t>> sorted(ranges.begin(), ranges.end());
+  std::sort(sorted.begin(), sorted.end());
+  for (size_t i = 1; i < sorted.size(); ++i) {
+    if (sorted[i].first < sorted[i - 1].first + sorted[i - 1].second) {
+      return false;
+    }
+  }
+  return true;
 }
 
 std::vector<std::string> GetActiveShardLocalRanks(
@@ -751,6 +853,107 @@ absl::Status CheckAllLayersHaveHostBuffers(
 
 }  // namespace
 
+struct KVCacheManagerBase::HostBouncePool
+    : public std::enable_shared_from_this<KVCacheManagerBase::HostBouncePool> {
+  // Sized above typical transformer layer counts (64-128 layers) so an
+  // all-layer H2D dispatch that holds one bounce lease per layer until the
+  // composite future settles recycles every buffer without re-running DmaMap.
+  static constexpr size_t kMaxCachedPerShard = 256;
+
+  explicit HostBouncePool(HostBufferAllocator alloc)
+      : allocator(alloc ? std::move(alloc) : MakeDefaultHostBufferAllocator()) {
+  }
+
+  absl::StatusOr<std::shared_ptr<HostBufferAllocation>> Acquire(
+      size_t shard_idx, size_t min_bytes, const xla::PjRtDevice* device) {
+    HostBufferAllocation cached;
+    bool found = false;
+    {
+      absl::MutexLock lock(mu);
+      if (closed) {
+        return absl::CancelledError("HostBouncePool is closed");
+      }
+      auto& vec = free_by_shard[shard_idx];
+      size_t best_idx = vec.size();
+      for (size_t i = 0; i < vec.size(); ++i) {
+        if (vec[i].size >= min_bytes &&
+            (best_idx == vec.size() || vec[i].size < vec[best_idx].size)) {
+          best_idx = i;
+        }
+      }
+      if (best_idx < vec.size()) {
+        cached = std::move(vec[best_idx]);
+        vec.erase(vec.begin() + static_cast<ptrdiff_t>(best_idx));
+        found = true;
+      } else if (vec.size() >= kMaxCachedPerShard) {
+        size_t smallest_idx = 0;
+        for (size_t i = 1; i < vec.size(); ++i) {
+          if (vec[i].size < vec[smallest_idx].size) {
+            smallest_idx = i;
+          }
+        }
+        vec.erase(vec.begin() + static_cast<ptrdiff_t>(smallest_idx));
+      }
+    }
+
+    if (!found) {
+      const size_t alloc_bytes = RoundUpBounceAllocBytes(min_bytes);
+      ABSL_ASSIGN_OR_RETURN(cached, allocator(alloc_bytes, device));
+      if (cached.ptr == nullptr || cached.size < min_bytes) {
+        return absl::InternalError(absl::StrCat(
+            "HostBouncePool allocator returned invalid buffer for size ",
+            alloc_bytes));
+      }
+    }
+
+    std::shared_ptr<HostBouncePool> self = shared_from_this();
+    auto* raw = new HostBufferAllocation(std::move(cached));
+    return std::shared_ptr<HostBufferAllocation>(
+        raw, [self = std::move(self), shard_idx](HostBufferAllocation* p) {
+          std::unique_ptr<HostBufferAllocation> owned(p);
+          self->Release(shard_idx, std::move(*owned));
+        });
+  }
+
+  void Release(size_t shard_idx, HostBufferAllocation alloc) {
+    if (alloc.ptr == nullptr || alloc.size == 0) {
+      return;
+    }
+    absl::MutexLock lock(mu);
+    if (closed) {
+      return;
+    }
+    auto& vec = free_by_shard[shard_idx];
+    if (vec.size() < kMaxCachedPerShard) {
+      vec.push_back(std::move(alloc));
+    }
+  }
+
+  void Close() {
+    absl::flat_hash_map<size_t, std::vector<HostBufferAllocation>> to_drop;
+    {
+      absl::MutexLock lock(mu);
+      closed = true;
+      to_drop.swap(free_by_shard);
+    }
+  }
+
+  HostBufferAllocator allocator;
+  absl::Mutex mu;
+  bool closed ABSL_GUARDED_BY(mu) = false;
+  absl::flat_hash_map<size_t, std::vector<HostBufferAllocation>> free_by_shard
+      ABSL_GUARDED_BY(mu);
+};
+
+std::shared_ptr<KVCacheManagerBase::HostBouncePool>
+KVCacheManagerBase::EnsureBouncePool() {
+  absl::MutexLock lock(allocated_host_dram_bytes_mu_);
+  if (!bounce_pool_) {
+    bounce_pool_ = std::make_shared<HostBouncePool>(host_allocator_);
+  }
+  return bounce_pool_;
+}
+
 KVCacheManagerBase::KVCacheManagerBase(
     const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
@@ -1085,6 +1288,16 @@ KVCacheManagerBase::~KVCacheManagerBase() {
   push_pool_.reset();
   dma_pool_.reset();
   pull_pool_.reset();
+  {
+    std::shared_ptr<HostBouncePool> pool;
+    {
+      absl::MutexLock lock(allocated_host_dram_bytes_mu_);
+      pool = std::move(bounce_pool_);
+    }
+    if (pool) {
+      pool->Close();
+    }
+  }
   buffer_holds_.clear();
   layers_ = StagingArena();
   host_block_manager_.reset();
@@ -3139,6 +3352,7 @@ KVCacheManagerBase::DispatchH2dWork(
                                  : max_physical_size_;
     int64_t layer_block_size = layer_block_byte_size(work.layer_idx);
     std::vector<raiden::H2dCopy> copies;
+    std::vector<std::shared_ptr<HostBufferAllocation>> bounce_leases;
     if (!is_partial) {
       if (base_host_ptr == nullptr) {
         return absl::FailedPreconditionError("Source host pointer is null");
@@ -3154,37 +3368,90 @@ KVCacheManagerBase::DispatchH2dWork(
       copies.push_back(
           {base_host_ptr, 0, static_cast<int64_t>(layer_phys_size)});
     } else {
+      std::vector<ByteCopySeg> segs;
+      segs.reserve(src_offsets_major_dim.size());
+      std::vector<std::pair<int64_t, int64_t>> dev_ranges;
+      dev_ranges.reserve(src_offsets_major_dim.size());
       for (size_t j = 0; j < src_offsets_major_dim.size(); ++j) {
-        int64_t src_major_dim_offset = src_offsets_major_dim[j];
-        int64_t dst_major_dim_offset = dst_offsets_major_dim[j];
-        int64_t major_dim_size = copy_sizes_major_dim[j];
+        int64_t src_offset = src_offsets_major_dim[j] * layer_block_size;
+        int64_t dst_offset = dst_offsets_major_dim[j] * layer_block_size;
+        int64_t size_to_copy = copy_sizes_major_dim[j] * layer_block_size;
 
-        int64_t src_offset = src_major_dim_offset * layer_block_size;
-        int64_t dst_offset = dst_major_dim_offset * layer_block_size;
-        int64_t size_to_copy = major_dim_size * layer_block_size;
-
+        if (size_to_copy > 0 && base_host_ptr == nullptr) {
+          return absl::FailedPreconditionError("Source host pointer is null");
+        }
         if (src_offset + size_to_copy > static_cast<int64_t>(host_size)) {
           return absl::InvalidArgumentError(
               "Copy range exceeds source host buffer size");
         }
-        if (dst_offset + size_to_copy > shard_info.device_size) {
+        if (dst_offset + size_to_copy >
+            static_cast<int64_t>(shard_info.device_size)) {
           return absl::InvalidArgumentError(
               "Copy range exceeds destination device buffer size");
         }
+        if (size_to_copy > 0) {
+          segs.push_back({.host_off = src_offset,
+                          .dev_off = dst_offset,
+                          .nbytes = size_to_copy});
+          dev_ranges.push_back({dst_offset, size_to_copy});
+        }
+      }
 
-        VLOG(1)
-            << "DispatchH2dWork: calling CopyRawHostToDevice (Partial). Layer: "
-            << work.layer_idx << ", Shard: " << work.shard_idx
-            << ", SrcOffset: " << src_offset << ", DstOffset: " << dst_offset
-            << ", Size: " << size_to_copy
-            << ", Thread: " << std::this_thread::get_id();
-
-        copies.push_back(
-            {base_host_ptr + src_offset, dst_offset, size_to_copy});
+      const bool has_live_pjrt =
+          shard_hold.is_common_buffer || shard_hold.c_hold != nullptr;
+      const bool can_bounce = IsHostBounceCoalesceEnabled() && has_live_pjrt &&
+                              segs.size() >= 2 && IntervalsDisjoint(dev_ranges);
+      if (can_bounce) {
+        std::sort(segs.begin(), segs.end(),
+                  [](const ByteCopySeg& a, const ByteCopySeg& b) {
+                    return a.dev_off < b.dev_off;
+                  });
+        const size_t max_bounce = MaxHostBounceBytes();
+        size_t i = 0;
+        while (i < segs.size()) {
+          size_t run_end = i + 1;
+          size_t run_bytes = static_cast<size_t>(segs[i].nbytes);
+          while (run_end < segs.size() &&
+                 segs[run_end].dev_off ==
+                     segs[run_end - 1].dev_off + segs[run_end - 1].nbytes &&
+                 run_bytes + static_cast<size_t>(segs[run_end].nbytes) <=
+                     max_bounce) {
+            run_bytes += static_cast<size_t>(segs[run_end].nbytes);
+            ++run_end;
+          }
+          if (run_end - i >= 2) {
+            ABSL_ASSIGN_OR_RETURN(
+                std::shared_ptr<HostBufferAllocation> lease,
+                EnsureBouncePool()->Acquire(work.shard_idx, run_bytes,
+                                            shard_hold.device));
+            size_t cursor = 0;
+            for (size_t m = i; m < run_end; ++m) {
+              std::memcpy(lease->ptr + cursor, base_host_ptr + segs[m].host_off,
+                          static_cast<size_t>(segs[m].nbytes));
+              cursor += static_cast<size_t>(segs[m].nbytes);
+            }
+            copies.push_back(
+                {lease->ptr, segs[i].dev_off, static_cast<int64_t>(run_bytes)});
+            bounce_leases.push_back(std::move(lease));
+          } else {
+            copies.push_back({base_host_ptr + segs[i].host_off, segs[i].dev_off,
+                              segs[i].nbytes});
+          }
+          i = run_end;
+        }
+      } else {
+        copies.reserve(segs.size());
+        for (const ByteCopySeg& seg : segs) {
+          copies.push_back(
+              {base_host_ptr + seg.host_off, seg.dev_off, seg.nbytes});
+        }
       }
     }
     TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture cf,
                         raiden::IssueH2dShard(shard_hold, copies));
+    for (auto& lease : bounce_leases) {
+      cf.AddKeepAlive(std::move(lease));
+    }
     local_futures.push_back(std::move(cf));
   }
   VLOG(1) << "KVCacheManagerBase::DispatchH2dWork completed. Dispatched "
@@ -3202,6 +3469,16 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
                                     const std::vector<int64_t>& copy_sizes) {
   VLOG(1) << "KVCacheManagerBase::DispatchD2hWork started. Works count: "
           << works.size() << ", Thread: " << std::this_thread::get_id();
+  struct D2hScatterSlice {
+    int64_t host_off;
+    size_t nbytes;
+  };
+  struct D2hScatterRun {
+    std::shared_ptr<HostBufferAllocation> lease;
+    uint8_t* dst_base = nullptr;
+    std::vector<D2hScatterSlice> slices;
+  };
+
   std::vector<raiden::PjRtCopyFuture> local_futures;
   for (const auto& work : works) {
     // Device side of the copy is layer_idx's buffer; host side is host layer
@@ -3239,6 +3516,7 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
                                  : max_physical_size_;
     int64_t layer_block_size = layer_block_byte_size(work.layer_idx);
     std::vector<raiden::D2hCopy> copies;
+    std::vector<D2hScatterRun> scatter_runs;
     if (!is_partial) {
       if (dst_host_ptr == nullptr) {
         return absl::FailedPreconditionError(
@@ -3256,13 +3534,21 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
       copies.push_back(
           {dst_host_ptr, 0, static_cast<int64_t>(layer_phys_size)});
     } else {
-      copies.reserve(src_offsets.size());
+      std::vector<ByteCopySeg> segs;
+      segs.reserve(src_offsets.size());
+      std::vector<std::pair<int64_t, int64_t>> host_ranges;
+      host_ranges.reserve(src_offsets.size());
       for (size_t j = 0; j < src_offsets.size(); ++j) {
         int64_t src_offset = src_offsets[j] * layer_block_size;
         int64_t dst_offset = dst_offsets[j] * layer_block_size;
         int64_t size_to_copy = copy_sizes[j] * layer_block_size;
 
-        if (src_offset + size_to_copy > shard_info.device_size) {
+        if (size_to_copy > 0 && dst_host_ptr == nullptr) {
+          return absl::FailedPreconditionError(
+              "Destination host pointer is null");
+        }
+        if (src_offset + size_to_copy >
+            static_cast<int64_t>(shard_info.device_size)) {
           return absl::InvalidArgumentError(
               "Copy range exceeds source device buffer size");
         }
@@ -3270,26 +3556,311 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
           return absl::InvalidArgumentError(
               "Copy range exceeds destination host buffer size");
         }
+        if (size_to_copy > 0) {
+          segs.push_back({.host_off = dst_offset,
+                          .dev_off = src_offset,
+                          .nbytes = size_to_copy});
+          host_ranges.push_back({dst_offset, size_to_copy});
+        }
+      }
 
-        VLOG(1)
-            << "DispatchD2hWork: calling CopyRawDeviceToHost (Partial). Layer: "
-            << work.layer_idx << ", Shard: " << work.shard_idx
-            << ", SrcOffset: " << src_offset << ", DstOffset: " << dst_offset
-            << ", Size: " << size_to_copy
-            << ", Thread: " << std::this_thread::get_id();
-
-        copies.push_back({dst_host_ptr + dst_offset, src_offset, size_to_copy});
+      const bool has_live_pjrt =
+          shard_hold.is_common_buffer || shard_hold.c_hold != nullptr;
+      const bool can_bounce = IsHostBounceCoalesceEnabled() && has_live_pjrt &&
+                              segs.size() >= 2 &&
+                              IntervalsDisjoint(host_ranges);
+      if (can_bounce) {
+        std::sort(segs.begin(), segs.end(),
+                  [](const ByteCopySeg& a, const ByteCopySeg& b) {
+                    return a.dev_off < b.dev_off;
+                  });
+        const size_t max_bounce = MaxHostBounceBytes();
+        size_t i = 0;
+        while (i < segs.size()) {
+          size_t run_end = i + 1;
+          size_t run_bytes = static_cast<size_t>(segs[i].nbytes);
+          while (run_end < segs.size() &&
+                 segs[run_end].dev_off ==
+                     segs[run_end - 1].dev_off + segs[run_end - 1].nbytes &&
+                 run_bytes + static_cast<size_t>(segs[run_end].nbytes) <=
+                     max_bounce) {
+            run_bytes += static_cast<size_t>(segs[run_end].nbytes);
+            ++run_end;
+          }
+          if (run_end - i >= 2) {
+            ABSL_ASSIGN_OR_RETURN(
+                std::shared_ptr<HostBufferAllocation> lease,
+                EnsureBouncePool()->Acquire(work.shard_idx, run_bytes,
+                                            shard_hold.device));
+            copies.push_back(
+                {lease->ptr, segs[i].dev_off, static_cast<int64_t>(run_bytes)});
+            D2hScatterRun run;
+            run.lease = std::move(lease);
+            run.dst_base = dst_host_ptr;
+            run.slices.reserve(run_end - i);
+            for (size_t m = i; m < run_end; ++m) {
+              run.slices.push_back(
+                  {.host_off = segs[m].host_off,
+                   .nbytes = static_cast<size_t>(segs[m].nbytes)});
+            }
+            scatter_runs.push_back(std::move(run));
+          } else {
+            copies.push_back({dst_host_ptr + segs[i].host_off, segs[i].dev_off,
+                              segs[i].nbytes});
+          }
+          i = run_end;
+        }
+      } else {
+        copies.reserve(segs.size());
+        for (const ByteCopySeg& seg : segs) {
+          copies.push_back(
+              {dst_host_ptr + seg.host_off, seg.dev_off, seg.nbytes});
+        }
       }
     }
 
-    TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture cf,
+    TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture raw_cf,
                         raiden::IssueD2hShard(shard_hold, copies));
-    local_futures.push_back(std::move(cf));
+    if (scatter_runs.empty()) {
+      local_futures.push_back(std::move(raw_cf));
+    } else {
+      auto [done_promise, done_future] = xla::MakePromise<>();
+      raw_cf.OnReady(
+          [scatter_runs = std::move(scatter_runs),
+           done_promise = std::move(done_promise)](
+              absl::StatusOr<raiden::BufferHolders> completion) mutable {
+            if (!completion.ok()) {
+              done_promise.Set(completion.status());
+              return;
+            }
+            for (const D2hScatterRun& run : scatter_runs) {
+              size_t cursor = 0;
+              for (const D2hScatterSlice& sl : run.slices) {
+                std::memcpy(run.dst_base + sl.host_off,
+                            run.lease->ptr + cursor, sl.nbytes);
+                cursor += sl.nbytes;
+              }
+            }
+            scatter_runs.clear();
+            done_promise.Set();
+          });
+      local_futures.push_back(
+          raiden::PjRtCopyFuture::FromFuture(std::move(done_future)));
+    }
   }
   VLOG(1) << "KVCacheManagerBase::DispatchD2hWork completed. Dispatched "
           << local_futures.size()
           << " buffer futures. Thread: " << std::this_thread::get_id();
   return local_futures;
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture>
+KVCacheManagerBase::D2hFromPackedDeviceBuffer(
+    absl::Span<const raiden::RaidenBufferHandle> packed_shards,
+    const std::vector<int64_t>& dst_offsets_major_dim,
+    const std::vector<int64_t>& copy_sizes_major_dim,
+    std::optional<int64_t> slot_idx) {
+  const absl::Time d2h_start = absl::Now();
+  if (buffer_holds_.empty()) {
+    return absl::FailedPreconditionError(
+        "D2hFromPackedDeviceBuffer requires a device-backed "
+        "KVCacheManagerBase");
+  }
+  if (packed_shards.size() != num_shards_) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("D2hFromPackedDeviceBuffer expected ", num_shards_,
+                     " packed shard handles, got ", packed_shards.size()));
+  }
+  if (dst_offsets_major_dim.size() != copy_sizes_major_dim.size()) {
+    return absl::InvalidArgumentError(
+        "dst_offsets_major_dim and copy_sizes_major_dim must have the same "
+        "length");
+  }
+  for (int64_t off : dst_offsets_major_dim) {
+    if (off < 0) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Negative destination offset: ", off));
+    }
+  }
+  int64_t total_blocks = 0;
+  for (int64_t sz : copy_sizes_major_dim) {
+    if (sz < 0) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Negative copy size: ", sz));
+    }
+    total_blocks += sz;
+  }
+  ABSL_RETURN_IF_ERROR(CheckAllLayersHaveHostBuffers(
+      "D2hFromPackedDeviceBuffer", /*target_layer_idx=*/std::nullopt,
+      layers_.size(), num_layers_));
+  if (total_blocks == 0 || dst_offsets_major_dim.empty()) {
+    return raiden::PjRtCopyFuture();
+  }
+
+  std::vector<int64_t> layer_packed_offsets(num_layers_, 0);
+  std::vector<size_t> layer_packed_bytes(num_layers_, 0);
+  int64_t total_packed_bytes = 0;
+  size_t max_single_layer_bytes = 0;
+  for (size_t l = 0; l < num_layers_; ++l) {
+    const int64_t row_bytes = layer_block_byte_size(l);
+    const int64_t l_bytes = total_blocks * row_bytes;
+    layer_packed_offsets[l] = total_packed_bytes;
+    layer_packed_bytes[l] = static_cast<size_t>(l_bytes);
+    max_single_layer_bytes =
+        std::max(max_single_layer_bytes, layer_packed_bytes[l]);
+    total_packed_bytes += l_bytes;
+  }
+
+  // Validate packed device shard sizes and per-layer host destination bounds
+  // up front before issuing any DMA.
+  std::vector<std::vector<uint8_t*>> host_ptrs(
+      num_shards_, std::vector<uint8_t*>(num_layers_, nullptr));
+  for (size_t sh = 0; sh < num_shards_; ++sh) {
+    if (packed_shards[sh].GetOnDeviceSizeInBytes() <
+        static_cast<size_t>(total_packed_bytes)) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Packed shard ", sh, " size (",
+                       packed_shards[sh].GetOnDeviceSizeInBytes(),
+                       ") is smaller than required packed bytes (",
+                       total_packed_bytes, ")"));
+    }
+    for (size_t l = 0; l < num_layers_; ++l) {
+      uint8_t* dst_ptr = nullptr;
+      size_t host_size = 0;
+      if (slot_idx.has_value()) {
+        ABSL_ASSIGN_OR_RETURN(
+            KVCacheHostSpan span,
+            HostSpan(l, sh, *slot_idx, staging_max_major_per_slot_));
+        dst_ptr = span.ptr;
+        host_size = span.nbytes;
+      } else {
+        dst_ptr = const_cast<uint8_t*>(layers_[l].shards[sh].host_ptr);
+        host_size = layers_[l].shards[sh].host_size;
+      }
+      if (dst_ptr == nullptr) {
+        return absl::FailedPreconditionError(
+            absl::StrCat("Destination host pointer is null at layer ", l,
+                         ", shard ", sh));
+      }
+      const int64_t row_bytes = layer_block_byte_size(l);
+      for (size_t j = 0; j < dst_offsets_major_dim.size(); ++j) {
+        const int64_t end_byte =
+            (dst_offsets_major_dim[j] + copy_sizes_major_dim[j]) * row_bytes;
+        if (end_byte > static_cast<int64_t>(host_size)) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "Copy range exceeds destination host buffer size at layer ", l));
+        }
+      }
+      host_ptrs[sh][l] = dst_ptr;
+    }
+  }
+
+  struct LayerScatterSpec {
+    uint8_t* dst_base = nullptr;
+    size_t bounce_offset = 0;
+    int64_t row_bytes = 0;
+  };
+  struct PackedBounceGroup {
+    std::shared_ptr<HostBufferAllocation> lease;
+    std::vector<LayerScatterSpec> layer_specs;
+  };
+
+  const size_t bounce_cap =
+      std::max(MaxHostBounceBytes(), max_single_layer_bytes);
+  std::vector<raiden::PjRtCopyFuture> shard_futures(num_shards_);
+
+  auto dispatch_shard =
+      [&](size_t sh) -> absl::StatusOr<raiden::PjRtCopyFuture> {
+    raiden::BufferHoldAndAlias packed_hold(packed_shards[sh]);
+    std::vector<raiden::D2hCopy> copies;
+    std::vector<PackedBounceGroup> groups;
+
+    size_t l = 0;
+    while (l < num_layers_) {
+      size_t group_end = l + 1;
+      size_t group_bytes = layer_packed_bytes[l];
+      while (group_end < num_layers_ &&
+             group_bytes + layer_packed_bytes[group_end] <= bounce_cap) {
+        group_bytes += layer_packed_bytes[group_end];
+        ++group_end;
+      }
+      ABSL_ASSIGN_OR_RETURN(
+          std::shared_ptr<HostBufferAllocation> lease,
+          EnsureBouncePool()->Acquire(sh, group_bytes, packed_hold.device));
+      copies.push_back({lease->ptr, layer_packed_offsets[l],
+                        static_cast<int64_t>(group_bytes)});
+
+      PackedBounceGroup group;
+      group.lease = std::move(lease);
+      group.layer_specs.reserve(group_end - l);
+      size_t rel_off = 0;
+      for (size_t m = l; m < group_end; ++m) {
+        group.layer_specs.push_back({.dst_base = host_ptrs[sh][m],
+                                     .bounce_offset = rel_off,
+                                     .row_bytes = layer_block_byte_size(m)});
+        rel_off += layer_packed_bytes[m];
+      }
+      groups.push_back(std::move(group));
+      l = group_end;
+    }
+
+    ABSL_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture raw_cf,
+                          raiden::IssueD2hShard(packed_hold, copies));
+    auto [done_promise, done_future] = xla::MakePromise<>();
+    raw_cf.OnReady(
+        [groups = std::move(groups), dst_offsets_major_dim,
+         copy_sizes_major_dim, done_promise = std::move(done_promise)](
+            absl::StatusOr<raiden::BufferHolders> completion) mutable {
+      if (!completion.ok()) {
+        done_promise.Set(completion.status());
+        return;
+      }
+      for (const PackedBounceGroup& group : groups) {
+        for (const LayerScatterSpec& spec : group.layer_specs) {
+          const uint8_t* src_layer_ptr =
+              group.lease->ptr + spec.bounce_offset;
+          size_t src_cursor = 0;
+          for (size_t j = 0; j < dst_offsets_major_dim.size(); ++j) {
+            const size_t seg_bytes = static_cast<size_t>(
+                copy_sizes_major_dim[j] * spec.row_bytes);
+            if (seg_bytes == 0) continue;
+            std::memcpy(
+                spec.dst_base + dst_offsets_major_dim[j] * spec.row_bytes,
+                src_layer_ptr + src_cursor, seg_bytes);
+            src_cursor += seg_bytes;
+          }
+        }
+      }
+      groups.clear();
+      done_promise.Set();
+    });
+    return raiden::PjRtCopyFuture::FromFuture(std::move(done_future));
+  };
+
+  if (num_shards_ <= 1) {
+    ABSL_ASSIGN_OR_RETURN(shard_futures[0], dispatch_shard(0));
+  } else {
+    std::vector<std::future<absl::StatusOr<raiden::PjRtCopyFuture>>> pending;
+    pending.reserve(num_shards_);
+    for (size_t sh = 0; sh < num_shards_; ++sh) {
+      int node = -1;
+      if (packed_shards[sh].device != nullptr) {
+        node = GetPjRtDeviceNumaNode(packed_shards[sh].device);
+      }
+      pending.push_back(dma_pool_->Schedule(
+          node >= 0 ? std::make_optional(node) : std::nullopt,
+          [&dispatch_shard, sh]() { return dispatch_shard(sh); }));
+    }
+    for (size_t sh = 0; sh < num_shards_; ++sh) {
+      ABSL_ASSIGN_OR_RETURN(shard_futures[sh], pending[sh].get());
+    }
+  }
+
+  return JoinAndRecordTelemetry(
+      *this, absl::MakeSpan(shard_futures), d2h_start,
+      telemetry::metric_names::kD2hTransferTimeMs,
+      telemetry::metric_names::kD2hBytesTotal,
+      static_cast<uint64_t>(total_packed_bytes));
 }
 
 // The transport's block report carries no unit index, and sessions ignore the

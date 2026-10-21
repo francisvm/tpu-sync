@@ -752,6 +752,54 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::D2h(
   return raiden::JoinPjRtCopyFutures(absl::MakeSpan(sub_copy_futures));
 }
 
+#ifndef WITHOUT_PYTHON
+absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::D2hFromPacked(
+    const nanobind::object& packed_array,
+    const std::vector<int64_t>& dst_offsets,
+    const std::vector<int64_t>& copy_sizes, bool unsafe_skip_buffer_lock) {
+  if (sub_managers_.empty()) {
+    return raiden::PjRtCopyFuture();
+  }
+  std::shared_ptr<std::vector<raiden::RaidenBufferHandle>> all_packed_shards;
+  try {
+    all_packed_shards =
+        std::make_shared<std::vector<raiden::RaidenBufferHandle>>(
+            ::jax::ExtractPjRtBuffersFromPyArray(packed_array,
+                                                 unsafe_skip_buffer_lock));
+  } catch (const std::exception& e) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Failed to unpack packed_array: ", e.what()));
+  }
+  if (all_packed_shards->size() != total_num_shards_) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Packed array shard count (", all_packed_shards->size(),
+        ") does not match manager shard count (", total_num_shards_, ")"));
+  }
+
+  std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
+  sub_copy_futures.reserve(sub_managers_.size());
+  for (size_t s = 0; s < sub_managers_.size(); ++s) {
+    std::vector<raiden::RaidenBufferHandle> sub_packed;
+    if (s < submanager_to_global_shards_.size() &&
+        !submanager_to_global_shards_[s].empty()) {
+      sub_packed.reserve(submanager_to_global_shards_[s].size());
+      for (int64_t g_sh : submanager_to_global_shards_[s]) {
+        sub_packed.push_back((*all_packed_shards)[static_cast<size_t>(g_sh)]);
+      }
+    } else {
+      sub_packed = *all_packed_shards;
+    }
+    ABSL_ASSIGN_OR_RETURN(
+        raiden::PjRtCopyFuture f,
+        sub_managers_[s]->base()->D2hFromPackedDeviceBuffer(
+            sub_packed, dst_offsets, copy_sizes));
+    f.AddKeepAlive(all_packed_shards);
+    sub_copy_futures.push_back(std::move(f));
+  }
+  return raiden::JoinPjRtCopyFutures(absl::MakeSpan(sub_copy_futures));
+}
+#endif
+
 absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
 NumaAwareKVCacheManager::D2hAutoAllocate(
     const std::vector<int64_t>& src_offsets,

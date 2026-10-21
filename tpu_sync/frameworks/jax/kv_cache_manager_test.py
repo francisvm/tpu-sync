@@ -820,6 +820,60 @@ class KVCacheManagerTest(parameterized.TestCase):
     # Out of range: GetHostBuffer fails and read_host_memory returns [].
     self.assertEqual(manager.read_host_memory(n_layers, 0, num_floats), [])
 
+  def test_fragmented_hbm_staging_and_host_bounce_roundtrip(self):
+    """Verifies strided HBM gather D2H + scattered host bounce H2D round-trip."""
+    from tpu_sync.api import jax as jax_api  # pylint: disable=g-import-not-at-top
+    from tpu_sync.api.jax import kv_cache_manager as py_mgr  # pylint: disable=g-import-not-at-top
+
+    del jax_api
+    tpu_sharding = self.setup_shardings()
+    n_layers = 3
+    test_shape = (8, 16, 8, 4, 32)
+    key = jax.random.key(909)
+
+    src_refs = []
+    src_arrs = []
+    dst_arrs = []
+    for i in range(n_layers):
+      sub_key = jax.random.fold_in(key, i)
+      base = jax.random.uniform(sub_key, test_shape, dtype=jnp.float32)
+      src_refs.append(np.asarray(base))
+      src_arrs.append(jax.device_put(base, tpu_sharding))
+      dst_arrs.append(
+          jax.device_put(jnp.zeros(test_shape, dtype=jnp.float32), tpu_sharding)
+      )
+    jax.block_until_ready(src_arrs)
+    jax.block_until_ready(dst_arrs)
+
+    manager = py_mgr.KVCacheManager(
+        kv_caches=src_arrs,
+        local_control_port=0,
+        host_blocks_to_allocate=8,
+        unsafe_skip_buffer_lock=self.skip_lock,
+        enable_hbm_staging=True,
+    )
+
+    # Strided non-contiguous HBM blocks [6, 1, 4, 2] -> scattered host slots
+    # [5, 0, 7, 3] via single packed HBM gather + bulk DMA.
+    src_blocks = [6, 1, 4, 2]
+    host_slots = [5, 0, 7, 3]
+    manager.d2h(src_blocks, host_slots, [1, 1, 1, 1]).Await()
+
+    # Load scattered host slots [5, 0, 7, 3] back into contiguous HBM blocks
+    # [0, 1, 2, 3] (exercises C++ host-bounce coalescing on H2D).
+    manager.h2d(host_slots, [0, 1, 2, 3], [1, 1, 1, 1]).Await()
+
+    for layer_idx in range(n_layers):
+      actual = np.asarray(src_arrs[layer_idx])
+      for k, orig_blk in enumerate(src_blocks):
+        np.testing.assert_array_equal(
+            actual[k], src_refs[layer_idx][orig_blk]
+        )
+
+    # Out-of-bounds block offset must raise ValueError loudly.
+    with self.assertRaisesRegex(ValueError, "out of bounds"):
+      manager.d2h([8], [0], [1])
+
 
 if __name__ == "__main__":
   absltest.main()

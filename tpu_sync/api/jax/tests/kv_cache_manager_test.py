@@ -541,6 +541,40 @@ class KVCacheManagerJaxTest(parameterized.TestCase):
 
     self.assertTrue(done_prod, "Producer did not finish sending in time")
 
+  def test_hbm_staging_fragmented_d2h_and_host_bounce_h2d(self):
+    tpu_sharding = self.setup_shardings()
+    shape = (8, 128, 8, 8, 128)
+    key = jax.random.key(2026)
+
+    src_refs = []
+    caches = []
+    for i in range(self.num_layers):
+      sub_key = jax.random.fold_in(key, i)
+      dev_arr, host_ref = self._generate_random_cache(
+          sub_key, shape, jnp.bfloat16, tpu_sharding
+      )
+      caches.append(dev_arr)
+      src_refs.append(host_ref)
+    jax.block_until_ready(caches)
+
+    engine = KVCacheManager(
+        kv_caches=caches,
+        local_control_port=0,
+        host_blocks_to_allocate=8,
+        unsafe_skip_buffer_lock=self.skip_lock,
+        enable_hbm_staging=True,
+    )
+
+    src_blocks = [7, 2, 5, 0]
+    host_slots = [6, 1, 4, 3]
+    engine.d2h(src_blocks, host_slots, [1, 1, 1, 1]).Await()
+    engine.h2d(host_slots, [0, 1, 2, 3], [1, 1, 1, 1]).Await()
+
+    for layer_idx in range(self.num_layers):
+      actual = np.asarray(caches[layer_idx])
+      for k, orig_blk in enumerate(src_blocks):
+        np.testing.assert_array_equal(actual[k], src_refs[layer_idx][orig_blk])
+
 
 if __name__ == "__main__":
   absltest.main()

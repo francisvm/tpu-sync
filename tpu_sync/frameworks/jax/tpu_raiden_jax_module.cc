@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -189,6 +190,25 @@ NB_MODULE(_tpu_raiden_jax, m) {
           nb::arg("src_offsets_major_dim") = nb::list(),
           nb::arg("dst_offsets_major_dim") = nb::list(),
           nb::arg("copy_sizes_major_dim") = nb::list())
+
+      .def(
+          "d2h_packed",
+          [](tpu_raiden::kv_cache::jax::KVCacheManager& self,
+             const nb::object& packed_array,
+             const std::vector<int64_t>& dst_offsets,
+             const std::vector<int64_t>& copy_sizes,
+             bool unsafe_skip_buffer_lock)
+              -> absl::StatusOr<tpu_raiden::RaidenFuture> {
+            ABSL_ASSIGN_OR_RETURN(
+                raiden::PjRtCopyFuture cf,
+                self.D2hFromPacked(packed_array, dst_offsets, copy_sizes,
+                                   unsafe_skip_buffer_lock));
+            return tpu_raiden::RaidenFuture{std::move(cf)};
+          },
+          nb::arg("packed_array"),
+          nb::arg("dst_offsets_major_dim"),
+          nb::arg("copy_sizes_major_dim"),
+          nb::arg("unsafe_skip_buffer_lock") = false)
 
       .def(
           "d2h_auto_allocate",

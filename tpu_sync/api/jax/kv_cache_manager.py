@@ -14,8 +14,43 @@
 
 """High-performance JAX KV Cache Manager (repurposed as TransferEngine)."""
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import os
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+
+import jax
+import jax.numpy as jnp
+
 from tpu_sync.frameworks.jax import _tpu_raiden_jax as _impl
+
+
+def _resolve_hbm_staging_enabled(explicit_flag: Optional[bool]) -> bool:
+  """Resolves whether on-device HBM gather staging is enabled for D2H."""
+  if explicit_flag is not None:
+    return explicit_flag
+  env_val = os.environ.get("RAIDEN_ENABLE_HBM_STAGING", "").strip().lower()
+  return env_val in ("1", "true", "on")
+
+
+def _build_hbm_gather_fn(
+    first_arr: Any,
+) -> Callable[[Sequence[Any], Any], Any]:
+  """Builds a chip-local JIT gather packing `[num_layers, num_blocks, ...]`."""
+  sharding = getattr(first_arr, "sharding", None)
+  if isinstance(sharding, jax.sharding.NamedSharding):
+    out_sharding = jax.sharding.NamedSharding(
+        sharding.mesh, jax.sharding.PartitionSpec(None, *sharding.spec)
+    )
+    return jax.jit(
+        lambda caches, idx: jnp.stack(
+            [jnp.take(layer, idx, axis=0) for layer in caches], axis=0
+        ),
+        out_shardings=out_sharding,
+    )
+  return jax.jit(
+      lambda caches, idx: jnp.stack(
+          [jnp.take(layer, idx, axis=0) for layer in caches], axis=0
+      )
+  )
 
 
 class KVCacheManager:
@@ -41,6 +76,7 @@ class KVCacheManager:
       worker_id: Optional[str] = None,
       enable_shm: bool = False,
       backend_configs: Optional[Sequence[Any]] = None,
+      enable_hbm_staging: Optional[bool] = None,
   ):
     """Instantiates the TransferEngine-based KVCacheManager.
 
@@ -78,7 +114,34 @@ class KVCacheManager:
         and set `<axis>_rank` to this worker's rank in [0, size). Duplicate or
         missing ranks cause wrong or missed recalls. An invalid config aborts
         the process (LOG(FATAL)) at registration.
+      enable_hbm_staging: Optional flag enabling on-device HBM gather staging
+        for fragmented D2H copies (defaults to `RAIDEN_ENABLE_HBM_STAGING`).
     """
+    self._kv_caches: List[Any] = list(kv_caches)
+    self._unsafe_skip_buffer_lock: bool = unsafe_skip_buffer_lock
+    self._enable_hbm_staging: bool = _resolve_hbm_staging_enabled(
+        enable_hbm_staging
+    )
+    self._num_device_blocks: int = 0
+    self._gather_layers_fn: Optional[Callable[[Sequence[Any], Any], Any]] = None
+    if self._enable_hbm_staging:
+      if not self._kv_caches:
+        raise ValueError("enable_hbm_staging requires non-empty kv_caches.")
+      first = self._kv_caches[0]
+      if len(first.shape) < 1:
+        raise ValueError(
+            f"kv_caches[0] must be at least 1D, got shape={first.shape}"
+        )
+      for idx, arr in enumerate(self._kv_caches[1:], start=1):
+        if arr.shape != first.shape or arr.dtype != first.dtype:
+          raise ValueError(
+              "enable_hbm_staging requires uniform shape and dtype across"
+              f" layers; layer 0 has ({first.shape}, {first.dtype}), layer"
+              f" {idx} has ({arr.shape}, {arr.dtype})"
+          )
+      self._num_device_blocks = int(first.shape[0])
+      self._gather_layers_fn = _build_hbm_gather_fn(first)
+
     if host_blocks_to_allocate is not None:
       self._impl = _impl.KVCacheManager(
           kv_caches,
@@ -195,6 +258,35 @@ class KVCacheManager:
     """
     if copy_sizes is None:
       copy_sizes = [1] * len(src_offsets)
+    if len(src_offsets) != len(dst_offsets) or len(src_offsets) != len(
+        copy_sizes
+    ):
+      raise ValueError(
+          "src_offsets, dst_offsets, and copy_sizes must have equal length:"
+          f" got {len(src_offsets)}, {len(dst_offsets)}, {len(copy_sizes)}"
+      )
+    if (
+        self._enable_hbm_staging
+        and self._gather_layers_fn is not None
+        and src_offsets
+    ):
+      block_indices: List[int] = []
+      for src_off, sz in zip(src_offsets, copy_sizes):
+        if src_off < 0 or sz < 0 or src_off + sz > self._num_device_blocks:
+          raise ValueError(
+              f"D2H range [{src_off}, {src_off + sz}) out of bounds for"
+              f" {self._num_device_blocks} device blocks"
+          )
+        block_indices.extend(range(src_off, src_off + sz))
+      if block_indices:
+        idx_arr = jnp.asarray(block_indices, dtype=jnp.int32)
+        packed_arr = self._gather_layers_fn(self._kv_caches, idx_arr)
+        return self._impl.d2h_packed(
+            packed_arr,
+            dst_offsets,
+            copy_sizes,
+            self._unsafe_skip_buffer_lock,
+        )
     return self._impl.d2h(src_offsets, dst_offsets, copy_sizes)
 
   def h2d(

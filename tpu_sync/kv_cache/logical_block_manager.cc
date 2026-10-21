@@ -25,6 +25,74 @@
 
 namespace tpu_raiden {
 namespace kv_cache {
+namespace {
+
+struct BlockExtent {
+  int start;
+  int length;
+};
+
+// Selects `count` block IDs from ascending-sorted `sorted_candidates`,
+// preferring a single best-fit contiguous extent when available and otherwise
+// packing the longest contiguous extents first to minimize DMA fragmentation.
+void AppendContiguousPreferredBlocks(absl::Span<const int> sorted_candidates,
+                                     int count, std::vector<int>& out) {
+  if (count <= 0 || sorted_candidates.empty()) {
+    return;
+  }
+
+  std::vector<BlockExtent> extents;
+  for (int id : sorted_candidates) {
+    if (!extents.empty() &&
+        id == extents.back().start + extents.back().length) {
+      ++extents.back().length;
+    } else {
+      extents.push_back({.start = id, .length = 1});
+    }
+  }
+
+  // Prefer the smallest single extent that satisfies `count` (best-fit),
+  // breaking ties by lowest start block ID.
+  const BlockExtent* best_fit = nullptr;
+  for (const BlockExtent& ext : extents) {
+    if (ext.length >= count) {
+      if (best_fit == nullptr || ext.length < best_fit->length ||
+          (ext.length == best_fit->length && ext.start < best_fit->start)) {
+        best_fit = &ext;
+      }
+    }
+  }
+  if (best_fit != nullptr) {
+    for (int i = 0; i < count; ++i) {
+      out.push_back(best_fit->start + i);
+    }
+    return;
+  }
+
+  // No single extent fits: take the longest extents first to minimize the
+  // number of discontiguous DMA runs.
+  std::sort(extents.begin(), extents.end(),
+            [](const BlockExtent& a, const BlockExtent& b) {
+              if (a.length != b.length) {
+                return a.length > b.length;
+              }
+              return a.start < b.start;
+            });
+
+  int remaining = count;
+  for (const BlockExtent& ext : extents) {
+    if (remaining <= 0) {
+      break;
+    }
+    const int take = std::min(remaining, ext.length);
+    for (int i = 0; i < take; ++i) {
+      out.push_back(ext.start + i);
+    }
+    remaining -= take;
+  }
+}
+
+}  // namespace
 
 LogicalBlockManager::LogicalBlockManager(int num_blocks)
     : total_blocks_(num_blocks), blocks_(num_blocks), num_free_(num_blocks) {}
@@ -54,7 +122,7 @@ absl::StatusOr<std::vector<int>> LogicalBlockManager::Allocate(
   }
 
   if (free_block_ids.size() + evictable_block_ids.size() <
-      num_blocks_to_allocate) {
+      static_cast<size_t>(num_blocks_to_allocate)) {
     return absl::ResourceExhaustedError(absl::StrCat(
         "Insufficient available blocks. Requested: ", num_blocks_to_allocate,
         ", Free: ", free_block_ids.size(),
@@ -65,20 +133,16 @@ absl::StatusOr<std::vector<int>> LogicalBlockManager::Allocate(
   std::vector<int> allocated_block_ids;
   allocated_block_ids.reserve(num_blocks_to_allocate);
 
-  // First, use free blocks.
-  int free_to_use =
+  // First, use free blocks, preferring contiguous extents.
+  const int free_to_use =
       std::min(static_cast<int>(free_block_ids.size()), num_blocks_to_allocate);
-  for (int i = 0; i < free_to_use; ++i) {
-    allocated_block_ids.push_back(free_block_ids[i]);
-  }
+  AppendContiguousPreferredBlocks(free_block_ids, free_to_use,
+                                  allocated_block_ids);
 
   // If we still need more blocks, evict from evictable_block_ids based on LRU
-  // policy. LRU policy evicts blocks with the smallest last_access_counter
-  // first.
-  int needed_blocks = num_blocks_to_allocate - free_to_use;
+  // policy. Within an equal-timestamp LRU cohort, prefer contiguous extents.
+  const int needed_blocks = num_blocks_to_allocate - free_to_use;
   if (needed_blocks > 0) {
-    // Sort evictable_block_ids such that the least recently accessed comes
-    // first.
     std::sort(evictable_block_ids.begin(), evictable_block_ids.end(),
               [this](int a, int b) {
                 if (blocks_[a].last_access_counter ==
@@ -89,13 +153,45 @@ absl::StatusOr<std::vector<int>> LogicalBlockManager::Allocate(
                        blocks_[b].last_access_counter;
               });
 
-    for (int i = 0; i < needed_blocks; ++i) {
-      int evict_id = evictable_block_ids[i];
-      // Clear previous allocation state before reuse.
-      blocks_[evict_id].is_allocated = false;
-      allocated_block_ids.push_back(evict_id);
+    int remaining_evict = needed_blocks;
+    size_t idx = 0;
+    while (idx < evictable_block_ids.size() && remaining_evict > 0) {
+      const uint64_t cohort_ts =
+          blocks_[evictable_block_ids[idx]].last_access_counter;
+      size_t cohort_end = idx + 1;
+      while (cohort_end < evictable_block_ids.size() &&
+             blocks_[evictable_block_ids[cohort_end]].last_access_counter ==
+                 cohort_ts) {
+        ++cohort_end;
+      }
+      const int cohort_size = static_cast<int>(cohort_end - idx);
+      if (cohort_size <= remaining_evict) {
+        for (size_t k = idx; k < cohort_end; ++k) {
+          const int evict_id = evictable_block_ids[k];
+          blocks_[evict_id].is_allocated = false;
+          allocated_block_ids.push_back(evict_id);
+        }
+        remaining_evict -= cohort_size;
+      } else {
+        std::vector<int> chosen;
+        chosen.reserve(remaining_evict);
+        AppendContiguousPreferredBlocks(
+            absl::MakeConstSpan(evictable_block_ids)
+                .subspan(idx, cohort_end - idx),
+            remaining_evict, chosen);
+        for (int evict_id : chosen) {
+          blocks_[evict_id].is_allocated = false;
+          allocated_block_ids.push_back(evict_id);
+        }
+        remaining_evict = 0;
+      }
+      idx = cohort_end;
     }
   }
+
+  // Return allocated IDs sorted in ascending order so adjacent free + evicted
+  // blocks merge into contiguous DMA runs downstream.
+  std::sort(allocated_block_ids.begin(), allocated_block_ids.end());
 
   // Increment global counter for new allocation access timestamp.
   ++access_counter_;

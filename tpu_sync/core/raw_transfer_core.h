@@ -415,6 +415,10 @@ struct PjRtCopyFuture {
   explicit PjRtCopyFuture(BufferHolders h)
       : future(xla::Future<>()), holds(std::move(h)) {}
 
+  static PjRtCopyFuture FromFuture(xla::Future<> f) {
+    return PjRtCopyFuture(std::move(f), {});
+  }
+
   template <typename T>
   static PjRtCopyFuture FromFuture(xla::Future<T> f) {
     auto ready_future = f.GetReadyFuture();
@@ -512,11 +516,15 @@ struct PjRtCopyFuture {
 
   template <typename F>
   void OnReady(F&& f) {
-    if (!future.IsValid() && !event_bundles.empty()) {
+    if (!event_bundles.empty()) {
       // One PJRT completion callback per event, joined into a single future.
       // Callbacks run on PJRT completion threads, so no thread is held per
-      // in-flight copy.
+      // in-flight copy. If `future` is also valid (e.g. joined across direct
+      // event copies and host-bounce async futures), include it in the join.
       std::vector<xla::Future<>> event_futures;
+      if (future.IsValid()) {
+        event_futures.push_back(std::move(future));
+      }
       for (const auto& b : event_bundles) {
         if (!b || !b->c_api) continue;
         for (PJRT_Event* e : b->events) {
@@ -547,6 +555,7 @@ struct PjRtCopyFuture {
           }
         }
       }
+      event_bundles.clear();
       // With no live events this is an already-successful future.
       future = xla::JoinFutures(event_futures);
     }
